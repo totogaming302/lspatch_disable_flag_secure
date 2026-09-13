@@ -50,7 +50,7 @@ jobs:
           INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
 
-          # 1. Download LSPatch (handling pre-releases and auth token limits)
+          # 1. Fetch LSPatch
           LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
@@ -61,7 +61,7 @@ jobs:
           fi
           wget -O lspatch.jar "$LSPATCH_URL"
 
-          # 2. Download Xposed Module APK
+          # 2. Fetch Xposed Module
           MODULE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
@@ -72,7 +72,7 @@ jobs:
           fi
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
-          # 3. Download apkeep CLI
+          # 3. Fetch apkeep
           APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/EFForg/apkeep/releases/latest \
             | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
@@ -82,7 +82,7 @@ jobs:
 
           mkdir -p apk_download
 
-          # 4. Fetch the target APK
+          # 4. Download Target Package
           if [ -n "$APP_ID" ]; then
             if [ -n "$DOWNLOAD_SOURCE" ]; then
               ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
@@ -92,7 +92,6 @@ jobs:
             FILE=$(ls apk_download | head -n 1)
             BASENAME="${FILE%.*}"
           elif [ -n "$APK_URL" ]; then
-            # Strip query params like ?dl=1 by saving to a fixed name
             wget -O apk_download/input.apk "$APK_URL"
             BASENAME="app"
           else
@@ -105,19 +104,44 @@ jobs:
             exit 1
           fi
 
-          # 5. Handle split APK bundles vs standalone APKs
-          FIRST_FILE=$(ls apk_download/* | head -n 1)
-          if ! file "$FIRST_FILE" | grep -q "Android package (APK)"; then
+          # 5. Extract XAPK/APKS/ZIP containers and resolve APKs
+          mkdir -p work_apks raw_extracted
+
+          for item in apk_download/*; do
+            if [ -f "$item" ]; then
+              # If file is an archive containing nested .apk files (e.g. .xapk, .apks, .zip)
+              if unzip -l "$item" 2>/dev/null | grep -q '\.apk$'; then
+                echo "Unpacking APK container: $item"
+                unzip -qo "$item" -d raw_extracted/
+                find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
+              # If file is already a standalone APK
+              elif [[ "$item" == *.apk ]] || unzip -l "$item" 2>/dev/null | grep -q "AndroidManifest.xml"; then
+                echo "Discovered standalone APK: $item"
+                cp "$item" work_apks/
+              fi
+            fi
+          done
+
+          APK_COUNT=$(ls work_apks/*.apk 2>/dev/null | wc -l)
+          echo "Discovered $APK_COUNT APK file(s)"
+
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "Error: Could not extract any valid APK files from download."
+            ls -la apk_download/
+            exit 1
+          elif [ "$APK_COUNT" -eq 1 ]; then
+            echo "Single APK detected; skipping merge step."
+            cp work_apks/*.apk main.apk
+          else
+            echo "Split APK detected ($APK_COUNT parts); merging with APKEditor..."
             APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               https://api.github.com/repos/REAndroid/APKEditor/releases \
               | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
             wget -O APKEditor.jar "$APKEDITOR_URL"
-            java -jar APKEditor.jar m -i apk_download -o main.apk
-          else
-            cp "$FIRST_FILE" main.apk
+            java -jar APKEditor.jar m -i work_apks -o main.apk
           fi
 
-          # 6. Run LSPatch
+          # 6. Apply LSPatch
           mkdir -p lspatch
           INJECT_FLAG=""
           if [ "$INJECTDEX" = "true" ]; then
@@ -130,7 +154,7 @@ jobs:
             $INJECT_FLAG \
             -o lspatch main.apk
 
-          # 7. Rename output APK
+          # 7. Package and rename output
           OUTPUT_FILE=$(ls lspatch/*.apk | head -n 1)
           mv "$OUTPUT_FILE" "lspatch/${BASENAME}_patched.apk"
 
