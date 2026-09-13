@@ -22,11 +22,8 @@ on:
           - "2"
       injectdex:
         description: "Inject dex directly (useful if apk is browser)"
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -53,7 +50,7 @@ jobs:
           INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
 
-          # Query /releases (includes pre-releases) and authenticate to prevent rate limits
+          # 1. Download LSPatch (handling pre-releases and auth token limits)
           LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
@@ -64,6 +61,7 @@ jobs:
           fi
           wget -O lspatch.jar "$LSPATCH_URL"
 
+          # 2. Download Xposed Module APK
           MODULE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
@@ -74,6 +72,7 @@ jobs:
           fi
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
+          # 3. Download apkeep CLI
           APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/EFForg/apkeep/releases/latest \
             | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
@@ -83,6 +82,7 @@ jobs:
 
           mkdir -p apk_download
 
+          # 4. Fetch the target APK
           if [ -n "$APP_ID" ]; then
             if [ -n "$DOWNLOAD_SOURCE" ]; then
               ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
@@ -92,7 +92,7 @@ jobs:
             FILE=$(ls apk_download | head -n 1)
             BASENAME="${FILE%.*}"
           elif [ -n "$APK_URL" ]; then
-            # Save to an explicit path to strip out URL query parameters like ?dl=1
+            # Strip query params like ?dl=1 by saving to a fixed name
             wget -O apk_download/input.apk "$APK_URL"
             BASENAME="app"
           else
@@ -101,11 +101,11 @@ jobs:
           fi
 
           if [ ! "$(ls -A apk_download)" ]; then
-            echo "apk_download is empty"
+            echo "apk_download directory is empty"
             exit 1
           fi
 
-          # Merge split APK bundles if needed, otherwise copy single APK
+          # 5. Handle split APK bundles vs standalone APKs
           FIRST_FILE=$(ls apk_download/* | head -n 1)
           if ! file "$FIRST_FILE" | grep -q "Android package (APK)"; then
             APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -117,6 +117,7 @@ jobs:
             cp "$FIRST_FILE" main.apk
           fi
 
+          # 6. Run LSPatch
           mkdir -p lspatch
           INJECT_FLAG=""
           if [ "$INJECTDEX" = "true" ]; then
@@ -129,6 +130,7 @@ jobs:
             $INJECT_FLAG \
             -o lspatch main.apk
 
+          # 7. Rename output APK
           OUTPUT_FILE=$(ls lspatch/*.apk | head -n 1)
           mv "$OUTPUT_FILE" "lspatch/${BASENAME}_patched.apk"
 
