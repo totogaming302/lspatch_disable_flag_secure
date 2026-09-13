@@ -6,15 +6,12 @@ on:
       app_id:
         description: "Android app package (e.g. com.instagram.android or com.app@version)"
         required: false
-
       apk_url:
         description: "Direct APK download link (only if you don't use package name)"
         required: false
-
       download_source:
         description: "APK download source (apk-pure, f-droid, huawei-app-gallery)"
         required: false
-
       signture_bypass:
         description: "Signature bypass level (increase if apk has protection) [default: 0]"
         default: "0"
@@ -23,7 +20,6 @@ on:
           - "0"
           - "1"
           - "2"
-
       injectdex:
         description: "Inject dex directly (useful if apk is browser)"
         default: "false"
@@ -35,60 +31,70 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
     steps:
       - name: Setup Java 21
-        uses: actions/setup-java@v5.2.0
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
 
-          echo "app_id=${{ github.event.inputs.app_id }}"
-          echo "apk_url=${{ github.event.inputs.apk_url }}"
-          echo "download_source=${{ github.event.inputs.download_source }}"
-          echo "signture_bypass=${{ github.event.inputs.signture_bypass }}"
-          echo "injectdex=${{ github.event.inputs.injectdex }}"
-
+          APP_ID="${{ github.event.inputs.app_id }}"
+          APK_URL="${{ github.event.inputs.apk_url }}"
+          DOWNLOAD_SOURCE="${{ github.event.inputs.download_source }}"
+          SIGNTURE_BYPASS="${{ github.event.inputs.signture_bypass }}"
+          INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
 
-          LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '.assets[] | select(.name=="lspatch.jar") | .browser_download_url')
-          echo "LSPATCH_URL=$LSPATCH_URL"
+          # Query /releases (includes pre-releases) and authenticate to prevent rate limits
+          LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/JingMatrix/LSPatch/releases \
+            | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
+
+          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
+            echo "Failed to resolve LSPATCH_URL"
+            exit 1
+          fi
           wget -O lspatch.jar "$LSPATCH_URL"
 
-          MODULE_URL=$(curl -s https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases/latest | jq -r '.assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url')
-          echo "MODULE_URL=$MODULE_URL"
+          MODULE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
+            | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
+
+          if [ -z "$MODULE_URL" ] || [ "$MODULE_URL" = "null" ]; then
+            echo "Failed to resolve MODULE_URL"
+            exit 1
+          fi
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
-          APKEEP_URL=$(curl -s https://api.github.com/repos/EFForg/apkeep/releases/latest | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url')
-          echo "APKEEP_URL=$APKEEP_URL"
-          wget -O apkeep "$APKEEP_URL"
+          APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/EFForg/apkeep/releases/latest \
+            | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
 
+          wget -O apkeep "$APKEEP_URL"
           chmod +x apkeep
+
           mkdir -p apk_download
 
-          if [ -n "${{ github.event.inputs.app_id }}" ]; then
-            SRC="${{ github.event.inputs.download_source }}"
-            echo "Using app_id with source=$SRC"
-
-            if [ -n "$SRC" ]; then
-              ./apkeep -a "${{ github.event.inputs.app_id }}" -d "$SRC" ./apk_download
+          if [ -n "$APP_ID" ]; then
+            if [ -n "$DOWNLOAD_SOURCE" ]; then
+              ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
             else
-              ./apkeep -a "${{ github.event.inputs.app_id }}" ./apk_download
+              ./apkeep -a "$APP_ID" ./apk_download
             fi
-
-            ls -la apk_download
-
             FILE=$(ls apk_download | head -n 1)
             BASENAME="${FILE%.*}"
-
-          elif [ -n "${{ github.event.inputs.apk_url }}" ]; then
-            echo "Using direct apk_url"
-            wget -P ./apk_download "${{ github.event.inputs.apk_url }}"
-            ls -la apk_download
+          elif [ -n "$APK_URL" ]; then
+            # Save to an explicit path to strip out URL query parameters like ?dl=1
+            wget -O apk_download/input.apk "$APK_URL"
+            BASENAME="app"
           else
             echo "No input provided"
             exit 1
@@ -99,39 +105,35 @@ jobs:
             exit 1
           fi
 
-          if ! file apk_download/* | grep -q "Android package (APK)"; then
-            APKEDITOR_URL=$(curl -s https://api.github.com/repos/REAndroid/APKEditor/releases/latest | jq -r '.assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url')
-            echo "APKEDITOR_URL=$APKEDITOR_URL"
+          # Merge split APK bundles if needed, otherwise copy single APK
+          FIRST_FILE=$(ls apk_download/* | head -n 1)
+          if ! file "$FIRST_FILE" | grep -q "Android package (APK)"; then
+            APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/REAndroid/APKEditor/releases \
+              | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
             wget -O APKEditor.jar "$APKEDITOR_URL"
-
-            java -jar APKEditor.jar m -i apk_download/* -o main.apk
+            java -jar APKEditor.jar m -i apk_download -o main.apk
           else
-            cp apk_download/* main.apk
+            cp "$FIRST_FILE" main.apk
           fi
 
-          ls -la
-
           mkdir -p lspatch
-
           INJECT_FLAG=""
-          if [ "${{ github.event.inputs.injectdex }}" = "true" ]; then
+          if [ "$INJECTDEX" = "true" ]; then
             INJECT_FLAG="--injectdex"
           fi
 
           java -jar lspatch.jar \
-            -l ${{ github.event.inputs.signture_bypass }} \
+            -l "$SIGNTURE_BYPASS" \
             -m Xposed-Disable-FLAG_SECURE.apk \
             $INJECT_FLAG \
             -o lspatch main.apk
 
-          ls -la lspatch
-
-          mkdir -p output
-
-          mv lspatch/* "lspatch/${BASENAME}.apk"
+          OUTPUT_FILE=$(ls lspatch/*.apk | head -n 1)
+          mv "$OUTPUT_FILE" "lspatch/${BASENAME}_patched.apk"
 
       - name: Upload patched APK
         uses: actions/upload-artifact@v4
         with:
           name: patched-apk
-          path: "lspatch/*"
+          path: "lspatch/*.apk"
